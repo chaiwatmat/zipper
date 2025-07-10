@@ -30,6 +30,14 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o zipper zipper.go
   -useRobocopy
 ```
 
+## Dry Run
+
+```aiignore
+./zipper -src dist -out app-1.0.0.zip -hash \
+  -copyto \\192.168.1.100\deploy -user myuser -pass pass123 \
+  -useRobocopy -dryrun
+```
+
 ## Result Files
 
 ```aiignore
