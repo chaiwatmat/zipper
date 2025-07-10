@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,12 +20,17 @@ import (
 )
 
 var (
-	sourcePath   string
-	targetZip    string
-	compression  string
-	writeHash    bool
-	excludeGlobs arrayFlags
-	workers      int
+	sourcePath     string
+	targetZip      string
+	compression    string
+	writeHash      bool
+	excludeGlobs   arrayFlags
+	workers        int
+	copyTo         string
+	netUser        string
+	netPass        string
+	useRobocopy    bool
+	verifyOnTarget bool
 )
 
 type arrayFlags []string
@@ -48,6 +54,11 @@ func init() {
 	flag.BoolVar(&writeHash, "hash", false, "Write SHA256 hash file (output.zip.sha256)")
 	flag.Var(&excludeGlobs, "exclude", "Exclude pattern (repeatable, e.g., -exclude **/*.log -exclude .git/**)")
 	flag.IntVar(&workers, "threads", runtime.NumCPU(), "Number of parallel workers for directories")
+	flag.StringVar(&copyTo, "copyto", "", "Copy zip file to UNC share path (e.g. \\\\host\\share)")
+	flag.StringVar(&netUser, "user", "", "Username for net use (optional)")
+	flag.StringVar(&netPass, "pass", "", "Password for net use (optional)")
+	flag.BoolVar(&useRobocopy, "useRobocopy", false, "Use robocopy for network copy")
+	flag.BoolVar(&verifyOnTarget, "verifyTarget", false, "Verify zip file hash after copying to share")
 	flag.Parse()
 }
 
@@ -79,6 +90,32 @@ func main() {
 	}
 
 	fmt.Printf("✅ Zip completed: %s\n", targetZip)
+
+	if copyTo != "" {
+		if useRobocopy {
+			err := copyWithRobocopy(copyTo, targetZip, netUser, netPass)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Robocopy failed: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			err := copyToWindowsShare(copyTo, targetZip, netUser, netPass)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Copy failed: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		fmt.Printf("✅ Copied zip to %s\n", copyTo)
+	}
+
+	if verifyOnTarget && writeHash {
+		err := verifyHashOnTarget(copyTo, targetZip)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Remote hash check failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✅ Remote file hash verified successfully")
+	}
 }
 
 func zipFileOrDir(source, output string, info os.FileInfo) error {
@@ -206,4 +243,113 @@ func writeSHA256(zipPath, hashPath string) error {
 
 	hashSum := hex.EncodeToString(hasher.Sum(nil))
 	return os.WriteFile(hashPath, []byte(hashSum), 0644)
+}
+
+func copyWithRobocopy(uncPath, zipFile, user, pass string) error {
+	// Step 1: net use (if needed)
+	mapCmd := []string{"net", "use", uncPath}
+	if user != "" && pass != "" {
+		mapCmd = append(mapCmd, pass, "/user:"+user)
+	}
+	mapCmd = append(mapCmd, "/persistent:no")
+
+	cmd := exec.Command("cmd", "/C", strings.Join(mapCmd, " "))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("net use failed: %v\n%s", err, output)
+	}
+
+	// Step 2: robocopy
+	srcDir := filepath.Dir(zipFile)
+	fileName := filepath.Base(zipFile)
+	roboCmd := exec.Command("robocopy", srcDir, uncPath, fileName, "/Z", "/R:3", "/W:5", "/NFL", "/NDL")
+	roboOut, err := roboCmd.CombinedOutput()
+	if err != nil {
+		// robocopy returns non-zero even on success — must check exit code
+		exitErr, ok := err.(*exec.ExitError)
+		if ok && exitErr.ExitCode() >= 8 {
+			return fmt.Errorf("robocopy failed: %v\n%s", err, roboOut)
+		}
+	}
+	fmt.Print(string(roboOut))
+
+	// Step 3: net use /delete
+	_ = exec.Command("cmd", "/C", "net", "use", uncPath, "/delete", "/yes").Run()
+	return nil
+}
+
+func copyToWindowsShare(uncPath, zipFile, user, pass string) error {
+	// Step 1: Map network share
+	mapCmd := []string{"net", "use", uncPath}
+	if user != "" && pass != "" {
+		mapCmd = append(mapCmd, pass, "/user:"+user)
+	}
+	mapCmd = append(mapCmd, "/persistent:no")
+
+	cmd := exec.Command("cmd", "/C", strings.Join(mapCmd, " "))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("net use failed: %s\n%s", err, output)
+	}
+
+	// Step 2: Copy file to share
+	dest := filepath.Join(uncPath, filepath.Base(zipFile))
+	srcData, err := os.Open(zipFile)
+	if err != nil {
+		return err
+	}
+	defer srcData.Close()
+
+	destFile, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("failed to create file on share: %v", err)
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, srcData)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: Disconnect
+	disconnect := exec.Command("cmd", "/C", "net", "use", uncPath, "/delete", "/yes")
+	disconnect.Run() // don't fail on disconnect error
+
+	return nil
+}
+
+func verifyHashOnTarget(uncPath, localZip string) error {
+	zipName := filepath.Base(localZip)
+	hashFile := zipName + ".sha256"
+
+	remoteZip := filepath.Join(uncPath, zipName)
+	remoteHash := filepath.Join(uncPath, hashFile)
+
+	// Read expected hash from .sha256 file
+	hashBytes, err := os.ReadFile(remoteHash)
+	if err != nil {
+		return fmt.Errorf("failed to read remote .sha256: %w", err)
+	}
+	expected := strings.TrimSpace(string(hashBytes))
+
+	// Calculate remote file hash using certutil (Windows-native)
+	cmd := exec.Command("certutil", "-hashfile", remoteZip, "SHA256")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("certutil failed: %s\n%s", err, out)
+	}
+
+	lines := strings.Split(string(out), "\n")
+	if len(lines) < 2 {
+		return fmt.Errorf("unexpected certutil output:\n%s", out)
+	}
+
+	actual := strings.TrimSpace(lines[1])
+	expected = strings.ToUpper(expected) // certutil uses uppercase
+
+	if actual != expected {
+		return fmt.Errorf("hash mismatch:\nExpected: %s\nActual:   %s", expected, actual)
+	}
+
+	return nil
 }
